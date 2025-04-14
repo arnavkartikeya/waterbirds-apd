@@ -1,0 +1,15 @@
+program: spd/experiments/tms/tms_decomposition.py
+method: grid
+metric:
+  name: final_closeness
+  goal: minimize
+parameters:
+  # topk:
+  #   # values: [0.211, 0.239, 0.25, 0.261, 0.289]
+  seed:
+    values: [0, 1, 2, 3, 4]
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- spd/experiments/tms/tms_topk_config.yaml
