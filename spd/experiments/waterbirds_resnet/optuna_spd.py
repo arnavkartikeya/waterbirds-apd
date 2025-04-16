@@ -5,18 +5,21 @@ Trains SPD final layers to match a pretrained ResNet's final 2 FC layers for Wat
 with:
 1) Distillation from the teacher model's final FC output
 2) Conditioning on subcomponent #0 for background detection
-3) Top-K subnetwork selection (topk) + topk_recon
+3) Top‑K subnetwork selection (topk) + topk_recon
 4) LP sparsity penalty
 
 Heavily modeled after the TMS "optimize" code with attributions, etc.
 """
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Imports
+# ──────────────────────────────────────────────────────────────────────────────
 import math
 import os
 from pathlib import Path
 from typing import Callable, Optional
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,25 +28,26 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from wilds import get_dataset
 
+import einops
+import yaml
+from pydantic import BaseModel, PositiveFloat, PositiveInt, Field
+
 from models import WaterbirdResNet18, SPDTwoLayerFC
-from spd.run_spd import get_lr_schedule_fn, get_lr_with_warmup
 from spd.hooks import HookedRootModule
 from spd.log import logger
 from spd.models.base import SPDModel
 from spd.module_utils import (
-    get_nested_module_attr,
     collect_nested_module_attrs,
+    get_nested_module_attr,
 )
+from spd.run_spd import get_lr_schedule_fn, get_lr_with_warmup
 from spd.types import Probability
 from spd.utils import set_seed
 from train_resnet import WaterbirdsSubset
 
-###############################
-# Additional SPD-style methods (same as before)
-###############################
-
-import einops
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper functions
+# ──────────────────────────────────────────────────────────────────────────────
 def calc_topk_mask(attribution_scores: torch.Tensor, topk: float, batch_topk: bool) -> torch.Tensor:
     batch_size = attribution_scores.shape[0]
     k = int(topk * batch_size) if batch_topk else int(topk)
@@ -60,6 +64,7 @@ def calc_topk_mask(attribution_scores: torch.Tensor, topk: float, batch_topk: bo
         mask.scatter_(dim=-1, index=topk_indices, value=True)
         return mask
 
+
 def calc_lp_sparsity_loss(
     out: torch.Tensor,
     attributions: torch.Tensor,
@@ -68,6 +73,7 @@ def calc_lp_sparsity_loss(
     d_model_out = out.shape[-1]
     scaled_attrib = attributions / d_model_out
     return (scaled_attrib.abs() + 1e-16) ** (0.5 * step_pnorm)
+
 
 @torch.inference_mode()
 def calc_activation_attributions(
@@ -80,48 +86,6 @@ def calc_activation_attributions(
         attributions += val.pow(2).sum(dim=-1)
     return attributions
 
-def calc_grad_attributions(
-    model_out: torch.Tensor,  # teacher or spd output
-    post_weight_acts: dict[str, torch.Tensor],
-    pre_weight_acts: dict[str, torch.Tensor],
-    component_weights: dict[str, torch.Tensor],
-    C: int,
-) -> torch.Tensor:
-    import torch.autograd as autograd
-    post_names = [k.removesuffix(".hook_post") for k in post_weight_acts.keys()]
-    pre_names = [k.removesuffix(".hook_pre") for k in pre_weight_acts.keys()]
-    comp_names = list(component_weights.keys())
-    assert set(post_names) == set(pre_names) == set(comp_names), "layer name mismatch"
-
-    batch_prefix = model_out.shape[:-1]
-    out_dim = model_out.shape[-1]
-    attribution_scores = torch.zeros((*batch_prefix, C), device=model_out.device)
-
-    component_acts = {}
-    for nm in pre_names:
-        pre_ = pre_weight_acts[nm + ".hook_pre"].detach()
-        w_ = component_weights[nm]
-        partial = einops.einsum(
-            pre_, w_, "... d_in, C d_in d_out -> ... C d_out"
-        )
-        component_acts[nm] = partial
-
-    for feature_idx in range(out_dim):
-        grads = autograd.grad(
-            model_out[..., feature_idx].sum(),
-            list(post_weight_acts.values()),
-            retain_graph=True,
-        )
-        feature_attrib = torch.zeros((*batch_prefix, C), device=model_out.device)
-        for grad_val, nm_post in zip(grads, post_weight_acts.keys()):
-            nm_clean = nm_post.removesuffix(".hook_post")
-            feature_attrib += einops.einsum(
-                grad_val, component_acts[nm_clean],
-                "... d_out, ... C d_out -> ... C"
-            )
-        attribution_scores += feature_attrib**2
-
-    return attribution_scores
 
 def calculate_attributions(
     model: SPDTwoLayerFC,
@@ -135,15 +99,17 @@ def calculate_attributions(
 ) -> torch.Tensor:
     if attribution_type == "gradient":
         import torch.autograd as autograd
+
         post_names = [k.removesuffix(".hook_post") for k in post_acts]
-        pre_names  = [k.removesuffix(".hook_pre") for k in pre_acts]
+        pre_names = [k.removesuffix(".hook_pre") for k in pre_acts]
         comp_names = list(component_acts.keys())
         assert set(post_names) == set(pre_names) == set(comp_names), \
             f"Mismatch: {post_names}, {pre_names}, {comp_names}"
+
         batch_shape = teacher_out.shape[:-1]
         c_dim = model.C
         attributions = torch.zeros((*batch_shape, c_dim), device=teacher_out.device)
-        out_dim = teacher_out.shape[-1]
+
         grad_list = autograd.grad(
             teacher_out.sum(),
             list(post_acts.values()),
@@ -154,56 +120,25 @@ def calculate_attributions(
             partial_contrib = einops.einsum(
                 grad_val, component_acts[lay_name], "... d_out, ... C d_out -> ... C"
             )
-            attributions += partial_contrib**2
+            attributions += partial_contrib ** 2
         return attributions
 
     elif attribution_type == "activation":
         attributions = torch.zeros((input_x.shape[0], model.C), device=input_x.device)
-        for layername, acts in component_acts.items():
+        for acts in component_acts.values():
             attributions += acts.pow(2).sum(dim=-1)
         return attributions
     else:
         raise ValueError(f"Invalid attribution_type={attribution_type}")
 
+
 def calc_recon_mse(pred: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return ((pred - ref) ** 2).mean(dim=-1).mean()
 
-###############################
-# The training script (modified to return a validation metric)
-###############################
 
-def _calc_param_mse(
-    params1,
-    params2, 
-    n_params,
-    device,
-):
-    param_match_loss = torch.tensor(0.0, device=device)
-    for name in params1:
-        param_match_loss = param_match_loss + ((params2[name] - params1[name]) ** 2).sum(dim=(-2, -1))
-    return param_match_loss / n_params
-
-def calc_param_match_loss(
-    param_names,
-    target_model,
-    spd_model,
-    n_params,
-    device,
-):
-    target_params = {}
-    spd_params = {}
-    for param_name in param_names:
-        target_params[param_name] = get_nested_module_attr(target_model, param_name + ".weight")
-        spd_params[param_name] = get_nested_module_attr(spd_model, param_name + ".weight").transpose(-1, -2)
-    return _calc_param_mse(
-        params1=target_params,
-        params2=spd_params,
-        n_params=n_params,
-        device=device,
-    )
-
-from pydantic import BaseModel, PositiveInt, PositiveFloat, Field
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
 class WaterbirdSPDConfig(BaseModel):
     seed: int = 0
     batch_size: PositiveInt = 32
@@ -215,7 +150,7 @@ class WaterbirdSPDConfig(BaseModel):
 
     distill_coeff: float = 1.0
     param_match_coeff: float = 0.0
-
+    cond_coeff: float = 1.0
     alpha_condition: float = 1.0
 
     C: PositiveInt = 40
@@ -241,375 +176,284 @@ class WaterbirdSPDConfig(BaseModel):
 
     attribution_type: str = "gradient"
 
-def set_As_and_Bs_to_unit_norm(spd_fc: torch.nn.Module):
-    with torch.no_grad():
-        A1 = spd_fc.fc1.A
-        B1 = spd_fc.fc1.B
-        for c in range(A1.shape[0]):
-            normA = A1[c].norm(p=2)
-            if normA > 1e-9:
-                A1[c] /= normA
-            normB = B1[c].norm(p=2)
-            if normB > 1e-9:
-                B1[c] /= normB
 
-        A2 = spd_fc.fc2.A
-        B2 = spd_fc.fc2.B
-        for c in range(A2.shape[0]):
-            normA = A2[c].norm(p=2)
-            if normA > 1e-9:
-                A2[c] /= normA
-            normB = B2[c].norm(p=2)
-            if normB > 1e-9:
-                B2[c] /= normB
-
-def fix_normalized_adam_gradients(spd_fc: torch.nn.Module):
-    with torch.no_grad():
-        def _proj_out_scale_direction(A, B, gradA, gradB):
-            A_vec = A.view(-1)
-            B_vec = B.view(-1)
-            gA_vec = gradA.view(-1)
-            gB_vec = gradB.view(-1)
-            v = torch.cat([A_vec, -B_vec], dim=0)
-            v_norm_sq = v.dot(v) + 1e-12
-            g = torch.cat([gA_vec, gB_vec], dim=0)
-            scale_coeff = g.dot(v) / v_norm_sq
-            new_g = g - scale_coeff * v
-            new_gA = new_g[:A_vec.shape[0]].view_as(gradA)
-            new_gB = new_g[A_vec.shape[0]:].view_as(gradB)
-            gradA.copy_(new_gA)
-            gradB.copy_(new_gB)
-
-        A1 = spd_fc.fc1.A
-        B1 = spd_fc.fc1.B
-        if A1.requires_grad and B1.requires_grad:
-            for c in range(A1.shape[0]):
-                if A1.grad is not None and B1.grad is not None:
-                    gradA1 = A1.grad[c]
-                    gradB1 = B1.grad[c]
-                    _proj_out_scale_direction(A1[c], B1[c], gradA1, gradB1)
-
-        A2 = spd_fc.fc2.A
-        B2 = spd_fc.fc2.B
-        if A2.requires_grad and B2.requires_grad:
-            for c in range(A2.shape[0]):
-                if A2.grad is not None and B2.grad is not None:
-                    gradA2 = A2.grad[c]
-                    gradB2 = B2.grad[c]
-                    _proj_out_scale_direction(A2[c], B2[c], gradA2, gradB2)
-
-def calc_schatten_loss(
-    As: dict[str, torch.Tensor],
-    Bs: dict[str, torch.Tensor],
-    mask: torch.Tensor,
-    p: float,
-    n_params: int,
-    device: torch.device,
-) -> torch.Tensor:
-    assert As.keys() == Bs.keys(), "As and Bs must have identical keys"
-    batch_size = mask.shape[0]
-    schatten_penalty = torch.zeros((), device=device)
-    for layer_name in As.keys():
-        A = As[layer_name]
-        B = Bs[layer_name]
-        S_A = einops.einsum(A, A, "... C d_in m, ... C d_in m -> ... C m")
-        S_B = einops.einsum(B, B, "... C m d_out, ... C m d_out -> ... C m")
-        S_AB = S_A * S_B
-        if S_AB.ndim == 2:
-            S_AB = S_AB.unsqueeze(0)
-        S_AB_topk = einops.einsum(S_AB, mask, "b C m, b C -> b C m")
-        schatten_penalty += ((S_AB_topk + 1e-16) ** (0.5 * p)).sum()
-    schatten_penalty = schatten_penalty / (n_params * batch_size)
-    return schatten_penalty
-
-def run_spd_waterbird(config, device):
+# ──────────────────────────────────────────────────────────────────────────────
+# Training routine
+# ──────────────────────────────────────────────────────────────────────────────
+def run_spd_waterbird(config: WaterbirdSPDConfig, device: torch.device):
     """
-    Trains the SPD model and then evaluates it over the training subset to return an average loss.
-    This evaluation metric serves as the objective for hyperparameter tuning.
+    Trains the SPD model and returns:
+        • total loss from the **last** training step (used as the Optuna objective)
+        • a dict with the last values of every individual loss term
+        • the trained SPD model
     """
     set_seed(config.seed)
-    logger.info(f"Running SPD Waterbird with manual teacher caching, config={config}")
+    logger.info(f"Running SPD Waterbird | config={config}")
 
-    # 1) Teacher load
+    # 1) Teacher
     ckpt = torch.load(config.teacher_ckpt, map_location="cpu")
-    if "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    else:
-        state_dict = ckpt 
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
     teacher_model = WaterbirdResNet18(num_classes=2, hidden_dim=512)
-    missing, unexpected = teacher_model.load_state_dict(state_dict, strict=False)
-    teacher_model.to(device)
-    teacher_model.eval()
+    teacher_model.load_state_dict(state_dict, strict=False)
+    teacher_model.to(device).eval()
 
-    trunk = teacher_model.features  
-    teacher_fc1 = teacher_model.fc1
-    teacher_fc2 = teacher_model.fc2
+    trunk = teacher_model.features
+    teacher_fc1, teacher_fc2 = teacher_model.fc1, teacher_model.fc2
 
-    # 2) SPD final-layers
+    # 2) SPD head
     spd_fc = SPDTwoLayerFC(
         in_features=512,
         hidden_dim=512,
         num_classes=2,
         C=config.C,
         m_fc1=config.m_fc1,
-        m_fc2=config.m_fc2
+        m_fc2=config.m_fc2,
     ).to(device)
 
-    waterbird_dataset = get_dataset(dataset="waterbirds", download=False)
-    dataset_size = len(waterbird_dataset)
-    print(f"Total dataset size: {dataset_size}")
-    
-    all_indices = np.arange(dataset_size)
-    np.random.shuffle(all_indices)
-    train_indices = all_indices[:2000].tolist()
+    # 3) Dataset (tiny subset for speed)
+    waterbird_dataset = get_dataset("waterbirds", download=False)
+    all_idx = np.random.permutation(len(waterbird_dataset))
+    train_idx = all_idx[:2000].tolist()
 
-    train_transform = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor()
-    ])
-    
     train_subset = WaterbirdsSubset(
-        waterbird_dataset, 
-        indices=train_indices,
-        transform=train_transform
+        waterbird_dataset,
+        indices=train_idx,
+        transform=T.Compose([T.Resize((224, 224)), T.ToTensor()]),
     )
     loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True)
 
-    # 4) Optimizer & LR schedule
+    # 4) Optimiser / schedule
     opt = optim.AdamW(spd_fc.parameters(), lr=config.lr, weight_decay=0.0)
     lr_sched_fn = get_lr_schedule_fn(config.lr_schedule, config.lr_exponential_halflife)
 
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
-
-    data_iter = iter(loader)
-    epoch = 0
-
+    data_iter, epoch = iter(loader), 0
     param_names = ["fc1", "fc2"]
 
-    for step in tqdm(range(config.steps+1), ncols=100):
+    last_losses: dict[str, float] | None = None
+
+    for step in tqdm(range(config.steps + 1), ncols=100):
+        # LR schedule
         step_lr = get_lr_with_warmup(
-            step=step,
-            steps=config.steps,
-            lr=config.lr,
-            lr_schedule_fn=lr_sched_fn,
-            lr_warmup_pct=config.lr_warmup_pct
+            step, config.steps, config.lr, lr_sched_fn, config.lr_warmup_pct
         )
         for g in opt.param_groups:
             g["lr"] = step_lr
 
+        # Batch
         try:
-            batch_data = next(data_iter)
+            imgs, bird_label, meta = next(data_iter)
         except StopIteration:
             epoch += 1
             data_iter = iter(loader)
-            batch_data = next(data_iter)
+            imgs, bird_label, meta = next(data_iter)
 
-        imgs, bird_label, meta = batch_data
         imgs = imgs.to(device)
-        bird_label = bird_label.to(device)
         background_label = meta.float().to(device)
 
         opt.zero_grad(set_to_none=True)
 
-        if getattr(config, "unit_norm_matrices", False):
-            set_As_and_Bs_to_unit_norm(spd_fc)
-
+        # Teacher forward
         with torch.no_grad():
-            feats = trunk(imgs)
-            feats = feats.flatten(1)
+            feats = trunk(imgs).flatten(1)
 
-        feats_with_grad = feats.detach().clone().requires_grad_(True)
-
-        teacher_cache = {}
-        teacher_cache["fc1.hook_pre"] = feats_with_grad
-        teacher_h_pre = teacher_fc1(feats_with_grad)
-        teacher_cache["fc1.hook_post"] = teacher_h_pre
-
-        teacher_h = torch.relu(teacher_h_pre)
+        feats_g = feats.detach().clone().requires_grad_(True)
+        teacher_cache = {
+            "fc1.hook_pre": feats_g,
+            "fc1.hook_post": teacher_fc1(feats_g),
+        }
+        teacher_h = torch.relu(teacher_cache["fc1.hook_post"])
         teacher_cache["fc2.hook_pre"] = teacher_h
-
         teacher_out = teacher_fc2(teacher_h)
         teacher_cache["fc2.hook_post"] = teacher_out
 
+        # SPD forward (+ hook capture)
         spd_fc.reset_hooks()
         cache_dict, fwd_hooks, _ = spd_fc.get_caching_hooks()
         with spd_fc.hooks(fwd_hooks, [], reset_hooks_end=True):
             spd_h_pre = spd_fc.fc1(feats)
-            spd_h = torch.relu(spd_h_pre)
-            spd_out = spd_fc.fc2(spd_h)
+            spd_out = spd_fc.fc2(torch.relu(spd_h_pre))
 
-        pre_weight_acts = {}
-        post_weight_acts = {}
-        comp_acts = {}
-        for k, v in cache_dict.items():
-            if k.endswith("hook_pre"):
-                pre_weight_acts[k] = v
-            elif k.endswith("hook_post"):
-                post_weight_acts[k] = v
-            elif k.endswith("hook_component_acts"):
-                comp_acts[k.removesuffix(".hook_component_acts")] = v
+        pre_weight_acts = {k: v for k, v in cache_dict.items() if k.endswith("hook_pre")}
+        post_weight_acts = {k: v for k, v in cache_dict.items() if k.endswith("hook_post")}
+        comp_acts = {
+            k.removesuffix(".hook_component_acts"): v
+            for k, v in cache_dict.items()
+            if k.endswith("hook_component_acts")
+        }
 
-        teacher_pre_acts = {k: v for k, v in teacher_cache.items() if k.endswith("hook_pre")}
-        teacher_post_acts = {k: v for k, v in teacher_cache.items() if k.endswith("hook_post")}
+        teacher_pre = {k: v for k, v in teacher_cache.items() if k.endswith("hook_pre")}
+        teacher_post = {k: v for k, v in teacher_cache.items() if k.endswith("hook_post")}
 
         attributions = calculate_attributions(
             model=spd_fc,
             input_x=feats,
             out=spd_out,
-            teacher_out=teacher_out if getattr(config, "distil_from_target", True) else spd_out,
-            pre_acts=teacher_pre_acts,
-            post_acts=teacher_post_acts,
+            teacher_out=teacher_out
+            if config.distil_from_target
+            else spd_out,
+            pre_acts=teacher_pre,
+            post_acts=teacher_post,
             component_acts=comp_acts,
-            attribution_type=config.attribution_type
+            attribution_type=config.attribution_type,
         )
 
-        out_topk = None
-        topk_mask = None
+        # Optional top‑k mask / recon
+        out_topk = topk_mask = None
         if config.topk is not None:
-            topk_attrs = attributions
-            if config.distil_from_target and topk_attrs.shape[-1] > 1:
-                topk_attrs = topk_attrs[..., :-1]
-
-            topk_mask = calc_topk_mask(topk_attrs, config.topk, batch_topk=getattr(config, "batch_topk", True))
-            if config.distil_from_target:
-                last_submask = torch.ones((*topk_mask.shape[:-1], 1), dtype=torch.bool, device=device)
-                topk_mask = torch.cat((topk_mask, last_submask), dim=-1)
-
+            topk_attrs = attributions[..., :-1] if config.distil_from_target else attributions
+            topk_mask = calc_topk_mask(topk_attrs, config.topk, batch_topk=config.batch_topk)
+            if config.distil_from_target:  # keep last component always on
+                last = torch.ones((*topk_mask.shape[:-1], 1), dtype=torch.bool, device=device)
+                topk_mask = torch.cat((topk_mask, last), dim=-1)
             spd_fc.reset_hooks()
             with spd_fc.hooks(*spd_fc.get_caching_hooks()[:2], reset_hooks_end=True):
-                hpre_topk = spd_fc.fc1(feats, topk_mask=topk_mask)
-                h_topk = torch.relu(hpre_topk)
+                h_topk = torch.relu(spd_fc.fc1(feats, topk_mask=topk_mask))
                 out_topk = spd_fc.fc2(h_topk, topk_mask=topk_mask)
 
-        distill_loss = mse(spd_out, teacher_out)
+        # ──────────────── loss terms ────────────────
+        distill_loss = mse(spd_out, teacher_out) * config.distill_coeff
 
         param_match_loss = torch.tensor(0.0, device=device)
-        if getattr(config, "param_match_coeff", 0.0) > 0:
-            param_val = calc_param_match_loss(
-                param_names=param_names,
-                target_model=teacher_model,
-                spd_model=spd_fc,
-                n_params=1,
-                device=device
-            )
-            param_match_loss = param_val.mean() * config.param_match_coeff
+        if config.param_match_coeff > 0:
+            target_params = {
+                p: get_nested_module_attr(teacher_model, p + ".weight") for p in param_names
+            }
+            spd_params = {
+                p: get_nested_module_attr(spd_fc, p + ".weight").transpose(-1, -2)
+                for p in param_names
+            }
+            diff = sum(((spd_params[p] - target_params[p]) ** 2).sum() for p in param_names)
+            param_match_loss = diff / len(param_names) * config.param_match_coeff
 
         topk_recon_loss = torch.tensor(0.0, device=device)
-        if getattr(config, "topk_recon_coeff", None) is not None and out_topk is not None:
+        if config.topk_recon_coeff is not None and out_topk is not None:
             topk_recon_loss = ((out_topk - teacher_out) ** 2).mean() * config.topk_recon_coeff
 
         lp_sparsity_loss = torch.tensor(0.0, device=device)
-        if getattr(config, "lp_sparsity_coeff", None) is not None and getattr(config, "pnorm", None) is not None:
-            lps = calc_lp_sparsity_loss(spd_out, attributions, config.pnorm)
-            lp_sparsity_loss = lps.sum(dim=-1).mean(dim=0) * config.lp_sparsity_coeff
+        if config.lp_sparsity_coeff is not None and config.pnorm is not None:
+            lp_vals = calc_lp_sparsity_loss(spd_out, attributions, config.pnorm)
+            lp_sparsity_loss = lp_vals.sum(dim=-1).mean() * config.lp_sparsity_coeff
 
-        A0 = spd_fc.fc1.A[0]
-        B0 = spd_fc.fc1.B[0]
-        sc0_feats = feats @ A0
-        sc0_logits = sc0_feats @ B0
-        h0 = sc0_logits[:, 0]
-        condition_loss = bce(h0, background_label) * getattr(config, "alpha_condition", 1.0)
+        # Condition subcomponent 0
+        attr0_logit = attributions[:, 0] * config.alpha_condition
+        condition_loss = bce(attr0_logit, background_label) * config.cond_coeff
 
-        total_loss = distill_loss + param_match_loss + topk_recon_loss + lp_sparsity_loss + condition_loss
+        total_loss = (
+            distill_loss
+            + param_match_loss
+            + topk_recon_loss
+            + lp_sparsity_loss
+            + condition_loss
+        )
 
+        # ──────────────── optimise ────────────────
         total_loss.backward()
         opt.step()
 
+        # Remember the latest losses (for Optuna return & logging)
+        last_losses = {
+            "total": total_loss.item(),
+            "distill": distill_loss.item(),
+            "param_match": param_match_loss.item(),
+            "topk_recon": topk_recon_loss.item(),
+            "lp_sparsity": lp_sparsity_loss.item(),
+            "condition": condition_loss.item(),
+        }
+
+        # Console logger
         if step % config.print_freq == 0:
             logger.info(
-                f"Step {step} | total={total_loss.item():.4f} "
-                f"distill={distill_loss.item():.4f}, param={param_match_loss.item():.4f}, "
-                f"topk={topk_recon_loss.item():.4f}, lp={lp_sparsity_loss.item():.4f}, cond={condition_loss.item():.4f}, lr={step_lr:.2e}"
+                f"Step {step:>5} | "
+                + ", ".join(f"{k}={v:.4f}" for k, v in last_losses.items())
+                + f", lr={step_lr:.2e}"
             )
 
-        if getattr(config, "save_freq", None) and step > 0 and step % config.save_freq == 0:
-            out_dir = getattr(config, "out_dir", None)
-            if out_dir:
-                Path(out_dir).mkdir(parents=True, exist_ok=True)
-                savepth = Path(out_dir) / f"waterbird_spd_step{step}.pth"
-                torch.save(spd_fc.state_dict(), savepth)
-                logger.info(f"Saved SPD checkpoint step={step} => {savepth}")
+        # Check‑pointing (optional)
+        if config.save_freq and step and step % config.save_freq == 0:
+            if config.out_dir:
+                Path(config.out_dir).mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    spd_fc.state_dict(),
+                    Path(config.out_dir) / f"waterbird_spd_step{step}.pth",
+                )
 
-    if getattr(config, "out_dir", None):
+    # Save final model if desired
+    if config.out_dir:
         Path(config.out_dir).mkdir(parents=True, exist_ok=True)
-        finalpth = Path(config.out_dir) / "waterbird_spd_final.pth"
-        torch.save(spd_fc.state_dict(), finalpth)
-        logger.info(f"Saved final SPD => {finalpth}")
+        torch.save(spd_fc.state_dict(), Path(config.out_dir) / "waterbird_spd_final.pth")
 
-    # --- Evaluation Phase ---
-    spd_fc.eval()
-    total_eval_loss = 0.0
-    count = 0
-    # We reuse the training loader (or you could use a dedicated validation set)
-    for batch in loader:
-        imgs, bird_label, meta = batch
-        imgs = imgs.to(device)
-        with torch.no_grad():
-            feats = trunk(imgs)
-            feats = feats.flatten(1)
-            teacher_h_pre = teacher_fc1(feats)
-            teacher_h = torch.relu(teacher_h_pre)
-            teacher_out = teacher_fc2(teacher_h)
-            spd_h_pre = spd_fc.fc1(feats)
-            spd_h = torch.relu(spd_h_pre)
-            spd_out = spd_fc.fc2(spd_h)
-            loss = mse(spd_out, teacher_out)
-        total_eval_loss += loss.item()
-        count += 1
-    avg_eval_loss = total_eval_loss / count if count > 0 else float('inf')
-    logger.info(f"Validation loss: {avg_eval_loss:.4f}")
-    return avg_eval_loss  # This evaluation metric is returned for hyperparameter optimization
+    return last_losses["total"], last_losses, spd_fc
 
-###############################
-# Optuna integration in __main__
-###############################
 
+# ──────────────────────────────────────────────────────────────────────────────
+# YAML helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def save_config_to_yaml(config: WaterbirdSPDConfig, path: str):
+    with open(path, "w") as f:
+        yaml.safe_dump(config.dict(), f)
+
+
+def load_config_from_yaml(path: str) -> WaterbirdSPDConfig:
+    with open(path, "r") as f:
+        return WaterbirdSPDConfig(**yaml.safe_load(f))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optuna entry‑point
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import optuna
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def objective(trial):
-        # Define the hyperparameter search space
-        batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-        lr = trial.suggest_loguniform('lr', 1e-4, 1e-2)
-        steps = trial.suggest_int('steps', 500, 1500)
-        distill_coeff = trial.suggest_float('distill_coeff', 0.5, 2.0)
-        param_match_coeff = trial.suggest_float('param_match_coeff', 0.0, 2.0)
-        topk = trial.suggest_float('topk', 1.0, 5.0)
-        lp_sparsity_coeff = trial.suggest_loguniform('lp_sparsity_coeff', 1e-3, 1e-1)
-
+    def objective(trial: optuna.trial.Trial):
+        # Hyper‑parameter search space
         cfg = WaterbirdSPDConfig(
-            batch_size=batch_size,
-            steps=steps,
-            lr=lr,
-            print_freq=50,
-            save_freq=None,         # Disable saving during hyperparameter trials
-            out_dir=None,           # Optionally disable output saving
+            batch_size=trial.suggest_categorical("batch_size", [16, 32, 64]),
+            lr=trial.suggest_loguniform("lr", 1e-4, 1e-2),
+            steps=trial.suggest_int("steps", 500, 1500),
+            distill_coeff=trial.suggest_float("distill_coeff", 0.5, 2.0),
+            param_match_coeff=trial.suggest_float("param_match_coeff", 1.0, 5.0),
+            topk=trial.suggest_float("topk", 1.0, 5.0),
+            lp_sparsity_coeff=trial.suggest_loguniform("lp_sparsity_coeff", 1e-3, 1e-1),
+            cond_coeff=trial.suggest_loguniform("cond_coeff", 0.5, 5.0),
+            topk_recon_coeff=trial.suggest_loguniform("topk_recon_coeff", 0.05, 0.5),
             seed=trial.number,
-            distill_coeff=distill_coeff,
-            param_match_coeff=param_match_coeff,
-            alpha_condition=1.0,
-            C=40,
-            m_fc1=16,
-            m_fc2=16,
-            lp_sparsity_coeff=lp_sparsity_coeff,
             pnorm=2.0,
-            topk=topk,
-            batch_topk=True,
-            topk_recon_coeff=0.1,
             teacher_ckpt="checkpoints/waterbird_resnet18_best.pth",
-            attribution_type="gradient",
-            lr_schedule="constant",
         )
 
-        final_loss = run_spd_waterbird(cfg, device)
-        return final_loss
+        # Save config
+        trial_dir = Path("optuna_trials")
+        trial_dir.mkdir(exist_ok=True)
+        save_config_to_yaml(cfg, trial_dir / f"trial_{trial.number}_config.yaml")
+
+        # Train
+        total, losses, spd_model = run_spd_waterbird(cfg, device)
+
+        # Store breakdown so we can access later
+        for k, v in losses.items():
+            trial.set_user_attr(k, v)
+
+        # Append to log file
+        with open(trial_dir / "total_losses.txt", "a") as f:
+            f.write(f"Trial {trial.number}: total_loss = {total:.6f}\n")
+
+        # Save model weights
+        torch.save(spd_model.state_dict(), trial_dir / f"trial_{trial.number}_spd.pth")
+
+        return total  # ← Optuna minimises total loss
 
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=30)
+    study.optimize(objective, n_trials=50)
 
-    print("Best trial:")
-    trial = study.best_trial
-    print(trial.params)
+    # ─── Summary ───
+    best = study.best_trial
+    print("\nBest trial:")
+    print(f"  number       = {best.number}")
+    print("  losses:")
+    for k in ("total", "distill", "param_match", "topk_recon", "lp_sparsity", "condition"):
+        print(f"    {k:<12}= {best.user_attrs[k]:.6f}")
+    print("  hyper‑params =", best.params)

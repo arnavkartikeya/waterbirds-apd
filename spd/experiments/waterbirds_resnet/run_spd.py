@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 from typing import Callable, Optional
 import numpy as np
+import yaml
 
 import torch
 import torch.nn as nn
@@ -43,7 +44,6 @@ from train_resnet import WaterbirdsSubset
 ###############################
 
 import einops
-
 
 # These are the SPD/TMS-like helper methods – topk, Lp-sparsity, etc.
 def calc_topk_mask(attribution_scores: torch.Tensor, topk: float, batch_topk: bool) -> torch.Tensor:
@@ -315,6 +315,7 @@ class WaterbirdSPDConfig(BaseModel):
 
     # For subcomponent #0 background detection
     alpha_condition: float = 1.0
+    cond_coeff: float = 1.0 
 
     # SPD subcomponent config
     C: PositiveInt = 40
@@ -344,6 +345,18 @@ class WaterbirdSPDConfig(BaseModel):
 
     # attribution type
     attribution_type: str = "gradient"  # or "activation"
+
+
+def save_config_to_yaml(config: WaterbirdSPDConfig, path: str):
+    with open(path, "w") as f:
+        yaml.safe_dump(config.dict(), f)
+
+def load_config_from_yaml(path: str) -> WaterbirdSPDConfig:
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    return WaterbirdSPDConfig(**data)
+
+
 
 def set_As_and_Bs_to_unit_norm(spd_fc: torch.nn.Module):
     """
@@ -730,17 +743,60 @@ def run_spd_waterbird(config, device):
             # shape (batch, C)
             lp_sparsity_loss = lps.sum(dim=-1).mean(dim=0)*config.lp_sparsity_coeff
 
+        # ─── add *after* lp_sparsity_loss is computed ──────────────────────────────────
+        # (i.e. just before you build total_loss)
+
+        # ─── ❶ Schatten‑rank loss ──────────────────────────────────────────────────────
+        schatten_loss = torch.tensor(0.0, device=device)
+        if (getattr(config, "schatten_coeff", None) is not None 
+                and getattr(config, "schatten_pnorm", None) is not None
+                and config.schatten_coeff != 0):
+            
+            # Build per‑layer dicts of A and B factors
+            As = {
+                "fc1": spd_fc.fc1.A,   # shape [C, d_in, m_fc1]
+                "fc2": spd_fc.fc2.A,   # shape [C, hidden_dim, m_fc2]
+            }
+            Bs = {
+                "fc1": spd_fc.fc1.B,   # shape [C, m_fc1, hidden_dim]
+                "fc2": spd_fc.fc2.B,   # shape [C, m_fc2, num_classes]
+            }
+
+            # A (batch,C) mask must be supplied; if you’re not using top‑k,
+            # just make it all‑ones.
+            if topk_mask is None:
+                mask = torch.ones((imgs.size(0), config.C), device=device, dtype=torch.bool)
+            else:
+                mask = topk_mask          # already shape (batch, C)
+
+            # Number of parameters in the factorised layers (for normalisation)
+            n_params = sum(A.numel() + B.numel() for A, B in zip(As.values(), Bs.values()))
+
+            schatten_loss = calc_schatten_loss(
+                As      = As,
+                Bs      = Bs,
+                mask    = mask,
+                p       = config.schatten_pnorm,
+                n_params= n_params,
+                device  = device,
+            ) * config.schatten_coeff
+        # ────────────────────────────────────────────────────────────────────────────────
+
+
         # condition subcomp #0
         # subcomp #0 => spd_fc.fc1.A[0], spd_fc.fc1.B[0]
-        A0 = spd_fc.fc1.A[0]
-        B0 = spd_fc.fc1.B[0]
-        sc0_feats = feats @ A0
-        sc0_logits= sc0_feats @ B0
-        h0 = sc0_logits[:,0]
-        condition_loss = bce(h0, background_label)*getattr(config,"alpha_condition",1.0)
+        attr0_logit = attributions[:, 0] * config.alpha_condition 
+        condition_loss = bce(attr0_logit, background_label) * getattr(config, "cond_coeff", None)
 
         total_loss = 0.0
-        total_loss = distill_loss + param_match_loss + topk_recon_loss + lp_sparsity_loss + condition_loss
+        total_loss = (
+            distill_loss
+            + param_match_loss
+            + topk_recon_loss
+            + lp_sparsity_loss
+            + condition_loss
+            + schatten_loss          # ← new term
+        )
 
         total_loss.backward()
         opt.step()
@@ -749,7 +805,9 @@ def run_spd_waterbird(config, device):
             logger.info(
                 f"Step {step} | total={total_loss.item():.4f} "
                 f"distill={distill_loss.item():.4f}, param={param_match_loss.item():.4f}, "
-                f"topk={topk_recon_loss.item():.4f}, lp={lp_sparsity_loss.item():.4f}, cond={condition_loss.item():.4f}, lr={step_lr:.2e}"
+                f"topk={topk_recon_loss.item():.4f}, lp={lp_sparsity_loss.item():.4f}, "
+                f"cond={condition_loss.item():.4f}, schatten={schatten_loss.item():.4f}, "
+                f"lr={step_lr:.2e}"
             )
 
         if getattr(config,"save_freq",None) and step>0 and step%config.save_freq==0:
@@ -771,23 +829,26 @@ def run_spd_waterbird(config, device):
 
 if __name__=="__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # getting from best optuna trial 
     cfg = WaterbirdSPDConfig(
         batch_size=32,
-        steps=1000,
-        lr=1e-3,
+        steps=1080,
+        lr=0.00013671959910091107,
         print_freq=50,
         save_freq=200,
         out_dir="waterbird_spd_out",
         seed=0,
         distill_coeff=1.0,
-        param_match_coeff=1.0,
+        param_match_coeff=0.9696180902100444,
         alpha_condition=1.0,
+        cond_coeff=4.910588964922575, 
+        schatten_coeff=0.0,
         C=40,
         m_fc1=16,
         m_fc2=16,
-        lp_sparsity_coeff=0.01,
+        lp_sparsity_coeff=0.004144459931345054,
         pnorm=2.0,
-        topk=2.0,
+        topk=1.1484885185100526,
         batch_topk=True,
         topk_recon_coeff=0.1,
         teacher_ckpt="checkpoints/waterbird_resnet18_best.pth",

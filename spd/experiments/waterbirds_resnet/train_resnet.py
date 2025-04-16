@@ -26,7 +26,7 @@ class WaterbirdsSubset(Dataset):
         x, y, meta = self.dataset[original_idx]
         if self.transform:
             x = self.transform(x)
-        return x, y, meta[0]
+        return x, y, meta[0] # 0 for land, 1 for water
 
 def main_resnet_train(
     batch_size=32,
